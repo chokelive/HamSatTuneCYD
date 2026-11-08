@@ -1,0 +1,7 @@
+{
+    "sketch": "HamSatTune_CYD\\HamSatTune_CYD.ino",
+    "board": "esp32:esp32:esp32",
+    "programmer": "esptool",
+    "port": "COM14",
+    "output": "../HamSatTune-CYD-build"
+}

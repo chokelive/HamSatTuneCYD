@@ -1,0 +1,23 @@
+# Arduino CLI and IDE build output
+.build/
+build/
+arduino_build_*/
+arduino_cache_*/
+
+# Temporary files
+.tmp/
+*.tmp
+
+# Compiled firmware and intermediate objects
+*.o
+*.a
+*.d
+*.elf
+*.bin
+*.map
+*.hex
+*.uf2
+
+# Common OS files
+.DS_Store
+Thumbs.db
