@@ -1,5 +1,4 @@
 #include <Preferences.h>
-#include <SPI.h>
 #include <cmath>
 #include "touch_input.h"
 
@@ -8,24 +7,37 @@ constexpr int8_t TOUCH_CS = 33;
 constexpr int8_t TOUCH_SCK = 25;
 constexpr int8_t TOUCH_MISO = 39;
 constexpr int8_t TOUCH_MOSI = 32;
-SPIClass touchSPI(HSPI);
 Preferences preferences;
 TouchPoint calibration[3];
 
+uint16_t touchTransfer(uint16_t value, uint8_t bits) {
+  uint16_t result = 0;
+  for (uint8_t i = 0; i < bits; ++i) {
+    digitalWrite(TOUCH_MOSI, (value >> (bits - 1 - i)) & 1);
+    digitalWrite(TOUCH_SCK, HIGH);
+    result = (result << 1) | digitalRead(TOUCH_MISO);
+    digitalWrite(TOUCH_SCK, LOW);
+  }
+  return result;
+}
+
 uint16_t readTouchAdc(uint8_t command) {
-  touchSPI.transfer(command);
-  return touchSPI.transfer16(0) >> 3;
+  touchTransfer(command, 8);
+  return touchTransfer(0, 16) >> 3;
 }
 }  // namespace
 
 void touchBegin() {
-  touchSPI.begin(TOUCH_SCK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
+  pinMode(TOUCH_SCK, OUTPUT);
+  pinMode(TOUCH_MOSI, OUTPUT);
+  pinMode(TOUCH_MISO, INPUT);
   pinMode(TOUCH_CS, OUTPUT);
+  digitalWrite(TOUCH_SCK, LOW);
+  digitalWrite(TOUCH_MOSI, LOW);
   digitalWrite(TOUCH_CS, HIGH);
 }
 
 TouchSample touchReadSample() {
-  touchSPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
   digitalWrite(TOUCH_CS, LOW);
 
   const uint16_t z1 = readTouchAdc(0xB1);
@@ -39,7 +51,6 @@ TouchSample touchReadSample() {
   }
 
   digitalWrite(TOUCH_CS, HIGH);
-  touchSPI.endTransaction();
   return {static_cast<int16_t>(totalX / 3),
           static_cast<int16_t>(totalY / 3), pressure};
 }

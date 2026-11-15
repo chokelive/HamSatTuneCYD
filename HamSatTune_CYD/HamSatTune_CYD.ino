@@ -4,6 +4,8 @@
 #include "tracking.h"
 #include "radio_ic705.h"
 #include <Preferences.h>
+#include <cstring>
+#include <time.h>
 
 bool touchCalibrated = false;
 bool touchConsumed = false;
@@ -11,9 +13,17 @@ size_t selectedProfileIndex = 0;
 size_t profileCount = 0;
 size_t firstVisibleProfile = 0;
 bool satelliteListOpen = false;
+bool mapOpen = false;
+enum class PassPage { Closed, List, Detail };
+PassPage passPage = PassPage::Closed;
+size_t firstVisiblePass = 0;
+size_t detailPassIndex = 0;
+uint32_t lastPassScan = 0;
+uint32_t lastMapDraw = 0;
+MapSnapshot mapSnapshot{};
 enum class SetupPage { Closed, Menu, GridEditor, CallsignEditor, Radio };
 SetupPage setupPage = SetupPage::Closed;
-TrackingResult lastTracking{0, 0, "--:--:-- UTC", "NO UTC"};
+TrackingResult lastTracking{0, 0, "--:--:-- UTC", "NO UTC", 0, 0.0};
 uint32_t lastRadioVersion = 0;
 char gridLocator[7] = "";
 char gridLocatorEdit[7] = "";
@@ -85,6 +95,8 @@ void saveCallsign() {
 
 void drawSetupMenu() {
   satelliteListOpen = false;
+  mapOpen = false;
+  passPage = PassPage::Closed;
   setupPage = SetupPage::Menu;
   const RadioSnapshot radio = radioSnapshot();
   displaySetupMenu(gridLocator, callsign, radioMainStatus(radio));
@@ -110,33 +122,91 @@ void drawCallsignEditor() {
 
 void drawScreen() {
   satelliteListOpen = false;
+  mapOpen = false;
+  passPage = PassPage::Closed;
   setupPage = SetupPage::Closed;
   const SatelliteProfile *profile =
       satelliteProfileAt(selectedProfileIndex);
   if (profile == nullptr) return;
 
-  lastTracking = trackingCalculate(*profile, gridLocator);
   const RadioSnapshot radio = radioSnapshot();
+  lastTracking = trackingCalculate(*profile, gridLocator,
+                                   radio.tuneOffsetHz);
   displayMainScreen(profile->name, profile->comment, profile->downlinkMode,
                     profile->uplinkMode, lastTracking.receiveHz,
-                    lastTracking.transmitHz, callsign, gridLocator,
+                    lastTracking.transmitHz, lastTracking.azimuthDeg,
+                    lastTracking.elevationDeg, callsign, gridLocator,
                     lastTracking.utc, lastTracking.status,
-                    radioMainStatus(radio));
+                    radioMainStatus(radio),
+                    trackingFreeTuneSupported(*profile));
+}
+
+void drawMap() {
+  const SatelliteProfile *profile = satelliteProfileAt(selectedProfileIndex);
+  if (!profile) return;
+  satelliteListOpen = false;
+  setupPage = SetupPage::Closed;
+  mapOpen = true;
+  passPage = PassPage::Closed;
+  const bool stationValid = trackingStationCoordinates(
+      gridLocator, mapSnapshot.stationLatDeg, mapSnapshot.stationLonDeg);
+  const bool mapValid = strcmp(lastTracking.status, "TRACKING") == 0 &&
+      trackingMapSnapshot(*profile, gridLocator, mapSnapshot);
+  displayMapScreen(profile->name, callsign, lastTracking.utc,
+                   lastTracking.status,
+                   lastTracking.azimuthDeg, lastTracking.elevationDeg,
+                   mapSnapshot, stationValid, mapValid);
+  lastMapDraw = millis();
+}
+
+void drawPassList() {
+  satelliteListOpen = false;
+  mapOpen = false;
+  setupPage = SetupPage::Closed;
+  passPage = PassPage::List;
+  const size_t count = trackingPassComplete() ? trackingPassCount() : 0;
+  if (count && firstVisiblePass >= count)
+    firstVisiblePass = (count - 1) / 5 * 5;
+  displayPassList(trackingPassAt(0), count, firstVisiblePass,
+                  static_cast<uint32_t>(time(nullptr)), trackingPassStatus());
+}
+
+void openPassPage() {
+  firstVisiblePass = 0;
+  trackingPassBegin(gridLocator, static_cast<uint32_t>(time(nullptr)));
+  lastPassScan = millis();
+  drawPassList();
+}
+
+void drawPassDetail() {
+  const PassPrediction *pass = trackingPassAt(detailPassIndex);
+  if (!pass) return;
+  passPage = PassPage::Detail;
+  displayPassDetail(*pass, static_cast<uint32_t>(time(nullptr)));
 }
 
 void refreshScreenValues() {
   const SatelliteProfile *profile = satelliteProfileAt(selectedProfileIndex);
   if (profile == nullptr) return;
-  lastTracking = trackingCalculate(*profile, gridLocator);
-  if (satelliteListOpen || setupPage != SetupPage::Closed) return;
   const RadioSnapshot radio = radioSnapshot();
+  lastTracking = trackingCalculate(*profile, gridLocator,
+                                   radio.tuneOffsetHz);
+  if (mapOpen) {
+    if (millis() - lastMapDraw >= 5000) drawMap();
+    return;
+  }
+  if (satelliteListOpen || passPage != PassPage::Closed ||
+      setupPage != SetupPage::Closed) return;
   displayUpdateMainValues(lastTracking.receiveHz, lastTracking.transmitHz,
+                          lastTracking.azimuthDeg, lastTracking.elevationDeg,
                           lastTracking.utc, lastTracking.status,
                           radioMainStatus(radio));
 }
 
 void drawSatelliteList() {
   satelliteListOpen = true;
+  mapOpen = false;
+  passPage = PassPage::Closed;
   setupPage = SetupPage::Closed;
   displaySatelliteList(profileCount, selectedProfileIndex, firstVisibleProfile);
 }
@@ -237,13 +307,10 @@ void handleTouch() {
 
   if (setupPage == SetupPage::Radio) {
     if (y >= 203 && y < 238) {
-      if (x >= 8 && x < 104) {
+      if (x >= 8 && x < 153) {
         radioPreparePairing();
         drawRadio();
-      } else if (x >= 112 && x < 208) {
-        radioToggleControl();
-        drawRadio();
-      } else if (x >= 216 && x < 312) {
+      } else if (x >= 167 && x < 312) {
         drawSetupMenu();
       }
     }
@@ -334,6 +401,42 @@ void handleTouch() {
     return;
   }
 
+  if (passPage == PassPage::Detail) {
+    if (x >= 216 && x < 312 && y >= 203 && y < 238) drawPassList();
+    return;
+  }
+
+  if (passPage == PassPage::List) {
+    if (y >= 203 && y < 238) {
+      if (x >= 8 && x < 104 && firstVisiblePass >= 5) {
+        firstVisiblePass -= 5;
+        drawPassList();
+      } else if (x >= 112 && x < 208 &&
+                 firstVisiblePass + 5 < trackingPassCount()) {
+        firstVisiblePass += 5;
+        drawPassList();
+      } else if (x >= 216 && x < 312) {
+        drawMap();
+      }
+    } else if (trackingPassComplete() && y >= 40 && y < 194 &&
+               (y - 40) % 31 < 29) {
+      const size_t index = firstVisiblePass + (y - 40) / 31;
+      if (index < trackingPassCount()) {
+        detailPassIndex = index;
+        drawPassDetail();
+      }
+    }
+    return;
+  }
+
+  if (mapOpen) {
+    if (y >= 201 && y < 238) {
+      if (x >= 136 && x < 220) openPassPage();
+      else if (x >= 232 && x < 312) drawScreen();
+    }
+    return;
+  }
+
   if (satelliteListOpen) {
     if (x >= 8 && x < 312 && y >= 51 && y < 199 &&
         (y - 51) % 37 < 35) {
@@ -342,6 +445,9 @@ void handleTouch() {
       if (profileIndex < profileCount) {
         if (profileIndex != selectedProfileIndex) radioProfileChanged();
         selectedProfileIndex = profileIndex;
+        const SatelliteProfile *selected = satelliteProfileAt(profileIndex);
+        Serial.printf("Selected: %s %s.\n", selected->name,
+                      selected->comment);
         drawScreen();
       }
     } else if (y >= 203 && y < 238) {
@@ -366,17 +472,32 @@ void handleTouch() {
     return;
   }
 
-  if (y >= 200 && y < 238 && x >= 8 && x < 153) {
-    const size_t maxFirst = profileCount > VISIBLE_PROFILE_ROWS
-                                ? profileCount - VISIBLE_PROFILE_ROWS
+  if (y >= 200 && y < 238) {
+    const SatelliteProfile *profile = satelliteProfileAt(selectedProfileIndex);
+    const bool showCenterButton = profile && trackingFreeTuneSupported(*profile);
+    const bool satellitesHit = x >= 8 &&
+        x < (showCenterButton ? 68 : 104);
+    const bool mapHit = x >= (showCenterButton ? 76 : 112) &&
+        x < (showCenterButton ? 136 : 208);
+    const bool centerHit = showCenterButton && x >= 144 && x < 236;
+    const bool setupHit = x >= (showCenterButton ? 244 : 216) && x < 312;
+    if (satellitesHit) {
+      const size_t maxFirst = profileCount > VISIBLE_PROFILE_ROWS
+                                  ? profileCount - VISIBLE_PROFILE_ROWS
+                                  : 0;
+      firstVisibleProfile = selectedProfileIndex > 1
+                                ? selectedProfileIndex - 1
                                 : 0;
-    firstVisibleProfile = selectedProfileIndex > 1
-                              ? selectedProfileIndex - 1
-                              : 0;
-    if (firstVisibleProfile > maxFirst) firstVisibleProfile = maxFirst;
-    drawSatelliteList();
-  } else if (y >= 200 && y < 238 && x >= 167 && x < 312) {
-    drawSetupMenu();
+      if (firstVisibleProfile > maxFirst) firstVisibleProfile = maxFirst;
+      drawSatelliteList();
+    } else if (mapHit) {
+      drawMap();
+    } else if (centerHit) {
+      radioCenterTune();
+      refreshScreenValues();
+    } else if (setupHit) {
+      drawSetupMenu();
+    }
   }
 }
 
@@ -408,8 +529,8 @@ void setup() {
   drawScreen();
   Serial.printf("Loaded %u satellite/mode profiles from embedded SQF data.\n",
                 static_cast<unsigned>(satelliteProfileCount()));
-  Serial.println("Open SETUP > IC-705 RADIO, then connect from the IC-705 to HamSatTune-CYD.");
-  Serial.println("Radio control starts OFF.");
+  Serial.println("On IC-705 open Bluetooth Set > Pairing Reception for BLE CI-V.");
+  Serial.println("Radio control starts automatically when tracking and IC-705 are ready.");
 }
 
 void loop() {
@@ -417,17 +538,44 @@ void loop() {
 
   static uint32_t lastDraw = 0;
   const SatelliteProfile *profile = satelliteProfileAt(selectedProfileIndex);
-  const uint32_t interval = profile && strcmp(profile->comment, "V/U FT4") == 0
-                                ? 250 : 1000;
+  const RadioSnapshot currentRadio = radioSnapshot();
+  const uint32_t interval = profile &&
+      (strcmp(profile->comment, "V/U FT4") == 0 ||
+       (currentRadio.control && trackingFreeTuneSupported(*profile)))
+          ? 250 : 1000;
+  if (currentRadio.tuneOffsetHz != lastTracking.tuneOffsetHz)
+    refreshScreenValues();
   if (millis() - lastDraw >= interval) {
     lastDraw = millis();
     refreshScreenValues();
   }
   radioTick(profile, lastTracking);
+  if (passPage != PassPage::Closed) {
+    if (passPage == PassPage::List && millis() - lastPassScan >= 60000) {
+      trackingPassBegin(gridLocator, static_cast<uint32_t>(time(nullptr)));
+      lastPassScan = millis();
+      drawPassList();
+    }
+    if (trackingPassTick(24) && passPage == PassPage::List) drawPassList();
+    static uint32_t lastPassTime = 0;
+    const uint32_t now = static_cast<uint32_t>(time(nullptr));
+    if (now != lastPassTime && trackingPassComplete()) {
+      lastPassTime = now;
+      if (passPage == PassPage::List)
+        displayPassListCountdowns(trackingPassAt(0), trackingPassCount(),
+                                  firstVisiblePass, now);
+      else if (passPage == PassPage::Detail) {
+        const PassPrediction *pass = trackingPassAt(detailPassIndex);
+        if (pass) displayPassDetailCountdown(*pass, now);
+      }
+    }
+  }
+  if (radioSnapshot().tuneOffsetHz != lastTracking.tuneOffsetHz)
+    refreshScreenValues();
   if (setupPage == SetupPage::Radio) {
     const RadioSnapshot radio = radioSnapshot();
     if (radio.version != lastRadioVersion) {
-      displayRadioScreen(radio);
+      displayUpdateRadioValues(radio);
       lastRadioVersion = radio.version;
     }
   }

@@ -1,6 +1,6 @@
 # HamSatTune CYD
 
-An ESP32 Cheap Yellow Display (CYD) sketch showing HamSatTune satellite profiles, UTC time, and tracked RX/TX frequencies. It can pair with an IC-705 over Bluetooth for CI-V readback and optional frequency control.
+An ESP32 Cheap Yellow Display (CYD) sketch showing HamSatTune satellite profiles, UTC time, and tracked RX/TX frequencies. It can pair with an IC-705 over Bluetooth for CI-V readback and automatic frequency control.
 
 ## Open in Arduino IDE
 
@@ -34,7 +34,7 @@ arduino-cli upload --port <your-port> --fqbn esp32:esp32:esp32:PartitionScheme=h
 
 Replace `<your-port>` with the connected board's serial port (for example `/dev/tty.usbserial-1140` on this Mac). Use the same `.build` path for compiling and uploading.
 
-The display and touch setup targets the common ESP32-2432S028 board with an ILI9341 screen and XPT2046 touch controller. Touch is read using the ESP32's built-in SPI library, so no separate touch library is needed. Other CYD revisions may use different hardware.
+The display and touch setup targets the common ESP32-2432S028 board with an ILI9341 screen and XPT2046 touch controller. The display uses VSPI, and touch uses software SPI on its own pins. No separate touch library is needed. Other CYD revisions may use different hardware.
 
 The sketch is split into `HamSatTune_CYD.ino` for application flow, `display_ui.cpp/.h` for drawing, `touch_input.cpp/.h` for touch input and calibration, `satellite_data.cpp/.h` for satellite profiles, `tracking.cpp/.h` for orbit tracking, and `radio_ic705.cpp/.h` for Bluetooth CI-V. Keep these files together in the `HamSatTune_CYD` sketch folder.
 
@@ -42,15 +42,20 @@ On first boot, tap the three calibration crosshairs (top-left, top-right, bottom
 
 ## IC-705 Bluetooth setup
 
-The CYD and IC-705 communicate wirelessly over Bluetooth Classic SPP. No USB or CI-V cable is needed between the two devices. Start pairing and connection from the IC-705, which searches for the CYD's SPP service.
+CI-V control uses the IC-705 BLE serial service.
 
-1. On the IC-705, enable Bluetooth. In **MENU > SET > Bluetooth Set > Data Device Set**, set **Serialport Function** to **CI-V (Echo Back OFF)**. Leave the radio's CI-V address at the default **A4**.
-2. On the CYD, open **SETUP > IC-705 RADIO**. The CYD advertises the Bluetooth device name **HamSatTune-CYD** and waits for the radio.
-3. On the IC-705, open **Bluetooth Set > Pairing/Connect > Device Search > Search Data Device**. Select **HamSatTune-CYD**. If prompted, confirm the passkey shown on the IC-705; the CYD accepts the pairing request and prints the passkey in Serial Monitor.
-4. Wait for the CYD radio page to show **CONNECTED** and for RX/TX frequency readback to appear. It also reports whether the radio is receiving or transmitting. If the IC-705 does not find the CYD, confirm Bluetooth is enabled and **Serialport Function** is set to **CI-V (Echo Back OFF)**, tap **PAIR** on the CYD, then search again.
-5. Select the desired satellite profile and make sure the main screen shows **TRACKING**. Return to **SETUP > IC-705 RADIO** and tap **START** to enable frequency control. Confirm the radio's VFO and split state on its display. Tap **STOP** to stop control.
+1. Enable Bluetooth on the IC-705 and leave its CI-V address at **A4**. The old HamSatTune-CYD Classic Data Device pairing is no longer used; remove it from the IC-705 pairing list.
+2. Open **SET > Bluetooth Set > Pairing Reception** on the IC-705. The CYD scans for the radio and initiates the BLE connection. Wait for `IC-705 BLE CI-V connected` and `IC-705 BLE CI-V ready for tuning` in Serial Monitor at 115200 baud.
+3. Select a satellite profile. Automatic tuning starts when the main screen says **TRACKING** and the radio link says **BT CONTROL**.
 
-Frequency control is off after each CYD reboot. It also stops on a Bluetooth disconnect, satellite change, invalid tracking data, or a CI-V command timeout. While enabled, the CYD selects VFO A, configures split and RX/TX modes for the chosen profile, and updates Doppler-corrected RX on VFO A and TX on VFO B. It reads the radio's transmit state and pauses frequency writes while transmitting; it never sends PTT. The IC-705's previous split and mode settings are not restored when control stops.
+The IC-705 BLE CI-V sign-in uses the service and characteristic UUIDs and three identification messages documented by [K7MDL2's working example](https://github.com/K7MDL2/IC-705-BLE-Serial-Example/wiki/Technical-Details). The CYD requires the ESP32 Arduino 3.3.11 BLE library. If the radio has no BLE pairing entry, repeat Pairing Reception. Do not use Search Data Device for CI-V in this build.
+
+Frequency control starts by default when the BLE CI-V link is connected, its receive state is known, and tracking is valid. It waits during transmission or when tracking is unavailable, and configures a new profile automatically. A CI-V write error stops control until reconnection or a profile change. It never sends PTT or restores previous split and mode settings.
+
+ISS SSTV satellite profiles remain available for frequency tracking, but audio decoding and the SSTV screen are not part of this BLE control build.
+Tap **MAP** on the main screen to see the selected satellite's position, its 90-minute ground track, and its approximate horizon footprint. The map wraps around the globe to keep the saved QTH longitude at the center. The map stays bright inside the satellite's footprint and dims outside it; the yellow line marks the boundary. The cyan marker shows the saved grid location; the green marker shows the satellite. **BACK** returns to the frequency screen. The map updates every five seconds while BLE tuning continues. It uses the map artwork from the original HamSatTune project, stored in firmware, and does not require a microSD card. When UTC, grid, or TLE data is unavailable, the map shows the tracking status instead of a satellite position.
+Tap **PASS** on the map to open the next-pass list. It shows one row per satellite with a current TLE, sorted by active pass and then AOS time. Each row shows its countdown, AOS, LOS, and maximum elevation. Tap a row for duration and AOS/LOS azimuths; use **PREV**, **NEXT**, and **BACK** to navigate. Pass times are UTC. The list searches 24 hours ahead from the saved grid location, updates its countdown every second, and recalculates about once a minute while open. Pass prediction uses a separate SGP4 instance so BLE tuning keeps using the selected satellite's live tracking state.
+For the **RS-44** and **FO-29** SSB/CW profiles, turn the IC-705 RX dial while control is running to free tune within the satellite's linear transponder. The CYD follows the new RX frequency with Doppler correction and moves the TX frequency in the opposite direction. The main screen has a **CENTER** button to return to the profile frequency; the radio screen shows **FREE TUNE** when offset from center. Free tuning resets when the Bluetooth link drops or the profile changes. FT4 and FM profiles keep their fixed frequencies. The CYD accepts dial positions only while both the nominal downlink and uplink remain inside the [published transponder passbands](https://www.amsat.org/live-linear-satellites-2/).
 
 When control starts, the sketch selects VFO A, sets split according to whether the profile has an uplink, sets RX/TX modes, and writes Doppler corrected RX to VFO A and TX to VFO B. It reads the radio's TX state and pauses writes while transmitting. It never sends a PTT command. The radio's prior split and mode settings are not restored when control stops.
 
@@ -61,16 +66,15 @@ When control starts, the sketch selects VFO A, sets split according to whether t
 - Normal and inverted linear-transponder frequency mapping.
 - A CYD landscape display with calibrated touch controls.
 - 20 satellite/mode profiles ported from HamSatTune's `Doppler.sqf`, including modes, offsets, transponder direction, and comments.
-- IC-705 Bluetooth Classic SPP pairing, CI-V readback, and opt-in VFO frequency and mode control.
+- IC-705 BLE CI-V pairing, readback, and automatic VFO frequency and mode control.
 
 ## Not yet implemented
 
-- HamSatTune manual radio tuning and correction of a reverse transponder after manual RX tuning.
-- Complete HamSatTune radio behavior, including manual tuning and restoring radio settings after control stops.
+- Complete HamSatTune radio behavior, including restoring radio settings after control stops.
 - A battery-backed clock for operation after a cold boot without WiFi.
 
 The embedded nominal frequencies come from HamSatTune's `Doppler.sqf`. Confirm the current satellite frequency plan before using a profile on air. The display shows `TRACKING` only when UTC, a grid locator, and a current TLE are available. Otherwise it shows nominal frequencies and a reason such as `NO UTC`, `SET GRID`, `NO TLE`, or `TLE OLD`. The bundled SGP4 code is from Hopperpop's Sgp4-Library (MIT license in `src/sgp4/LICENSE`).
 
 ## Safety
 
-The radio feature writes CI-V frequency, mode, VFO, and split settings after you tap **START**; it does not key the transmitter. Confirm the selected satellite profile, frequency plan, antenna, and IC-705 display before transmitting. Hardware pairing and radio readback still require verification on a physical IC-705.
+The radio feature writes CI-V frequency, mode, VFO, and split settings automatically when the IC-705 connects and tracking is valid; it does not key the transmitter. Confirm the selected satellite profile, frequency plan, antenna, and IC-705 display before transmitting. Hardware pairing and radio readback still require verification on a physical IC-705.

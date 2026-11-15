@@ -1,15 +1,14 @@
 #include "radio_ic705.h"
 
-#include <BluetoothSerial.h>
 #include <cmath>
 #include <cstring>
 
+#include "civ_ble.h"
 #include "civ_codec.h"
 
 namespace {
 constexpr uint8_t RADIO_ADDRESS = 0xA4;
 constexpr uint8_t CONTROLLER_ADDRESS = 0xE0;
-BluetoothSerial bluetooth;
 SemaphoreHandle_t stateMutex = nullptr;
 RadioSnapshot state;
 
@@ -24,8 +23,14 @@ uint32_t lastRxPoll = 0;
 uint32_t lastTxPoll = 0;
 uint32_t lastRxSent = 0;
 uint32_t lastTxSent = 0;
+uint32_t lastDialChange = 0;
+uint32_t rxReadExpectedHz = 0;
+uint32_t dialReadHz = 0;
+bool dialReadReady = false;
 uint8_t setupStep = 0;
 bool protocolActive = false;
+uint32_t profileChangeAt = 0;
+uint32_t profileSettleMs = 300;
 uint8_t frame[32]{};
 size_t frameLength = 0;
 
@@ -37,50 +42,49 @@ void setLink(RadioLinkState link) {
   }
   if (link != RadioLinkState::Connected) {
     state.control = false;
+    state.fault = false;
     state.pttKnown = false;
     state.rxKnown = false;
     state.txKnown = false;
+    state.tuneOffsetHz = 0;
   }
   xSemaphoreGive(stateMutex);
 }
 
-void disarm() {
+void disarm(bool fault = false) {
   xSemaphoreTake(stateMutex, portMAX_DELAY);
-  if (state.control) {
+  if (state.control || state.tuneOffsetHz != 0 ||
+      (fault && !state.fault)) {
     state.control = false;
+    state.tuneOffsetHz = 0;
+    if (fault) state.fault = true;
     ++state.version;
   }
   xSemaphoreGive(stateMutex);
   setupStep = 0;
   lastRxSent = 0;
   lastTxSent = 0;
+  lastDialChange = 0;
+  rxReadExpectedHz = 0;
+  dialReadReady = false;
+  waiting = Command::None;
 }
 
 void initializeBluetooth() {
-  // The IC-705 searches for and opens the data-device SPP connection.
-  if (!bluetooth.begin("HamSatTune-CYD", false)) {
+  // The CYD connects to the IC-705 BLE CI-V server.
+  if (!civBleBegin()) {
+    Serial.println("IC-705 CI-V BLE start failed.");
     setLink(RadioLinkState::Error);
     return;
   }
-  bluetooth.setPin("0000", 4);
-  bluetooth.onConfirmRequest([](uint32_t passkey) {
-    Serial.printf("Bluetooth pairing passkey: %06lu; confirm it on the IC-705.\n",
-                  static_cast<unsigned long>(passkey));
-    // The IC-705 is the initiating device; confirm the pairing on its screen.
-    bluetooth.confirmReply(true);
-  });
-  bluetooth.onAuthComplete([](bool success) {
-    Serial.printf("Bluetooth authentication %s.\n",
-                  success ? "succeeded" : "failed");
-  });
 }
 
 void sendCommand(const uint8_t *payload, size_t length, Command command) {
   uint8_t packet[18] = {0xFE, 0xFE, RADIO_ADDRESS, CONTROLLER_ADDRESS};
   memcpy(packet + 4, payload, length);
   packet[4 + length] = 0xFD;
-  if (bluetooth.write(packet, length + 5) != length + 5) {
-    disarm();
+  if (civBleWrite(packet, length + 5) != length + 5) {
+    disarm(true);
     return;
   }
   waiting = command;
@@ -115,7 +119,7 @@ void handleFrame(size_t length) {
   if (command == 0xFA) {
     if (waiting != Command::None) {
       Serial.println("IC-705 rejected CI-V command.");
-      disarm();
+      disarm(true);
       waiting = Command::None;
     }
     return;
@@ -139,6 +143,11 @@ void handleFrame(size_t length) {
   } else if (command == 0x25 && length >= 12 && frame[5] <= 1) {
     uint32_t frequency;
     if (!civ::decodeFrequency(frame + 6, frequency)) return;
+    if (frame[5] == 0 && waiting == Command::ReadRx) {
+      dialReadHz = frequency;
+      dialReadReady = true;
+      lastRxPoll = millis();  // Leave a command slot after every reply.
+    }
     xSemaphoreTake(stateMutex, portMAX_DELAY);
     if (frame[5] == 0) {
       if (!state.rxKnown || state.rxHz != frequency) ++state.version;
@@ -156,8 +165,8 @@ void handleFrame(size_t length) {
 }
 
 void readFrames() {
-  while (bluetooth.available()) {
-    const uint8_t value = bluetooth.read();
+  while (civBleAvailable()) {
+    const uint8_t value = civBleRead();
     if (frameLength == 0) {
       if (value == 0xFE) frame[frameLength++] = value;
       continue;
@@ -203,27 +212,40 @@ void radioPreparePairing() {
   xSemaphoreGive(stateMutex);
 }
 
-void radioToggleControl() {
+void radioProfileChanged() {
+  // A delayed ACK from the old profile must not advance the new setup.
+  profileSettleMs = waiting >= Command::SelectA ? 1500 : 300;
+  disarm();
   xSemaphoreTake(stateMutex, portMAX_DELAY);
-  if (state.link == RadioLinkState::Connected && state.pttKnown) {
-    state.control = !state.control;
+  if (state.fault) {
+    state.fault = false;
     ++state.version;
-    setupStep = 0;
-    lastRxSent = 0;
-    lastTxSent = 0;
   }
   xSemaphoreGive(stateMutex);
+  frameLength = 0;
+  profileChangeAt = millis();
 }
 
-void radioProfileChanged() { disarm(); }
+void radioCenterTune() {
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  if (state.tuneOffsetHz != 0) {
+    state.tuneOffsetHz = 0;
+    ++state.version;
+    lastRxSent = 0;
+    lastTxSent = 0;
+    lastDialChange = 0;
+  }
+  xSemaphoreGive(stateMutex);
+  dialReadReady = false;
+  rxReadExpectedHz = 0;
+}
 
 void radioTick(const SatelliteProfile *profile, const TrackingResult &tracking) {
   RadioSnapshot snapshot = radioSnapshot();
   if (snapshot.link != RadioLinkState::Connected) {
-    if (bluetooth.connected()) {
-      // Accept the SPP link opened by the IC-705 as a data-device client.
+    if (civBleConnected()) {
       setLink(RadioLinkState::Connected);
-      Serial.println("IC-705 Bluetooth SPP connected.");
+      Serial.println("IC-705 BLE CI-V ready for tuning.");
       snapshot = radioSnapshot();
     } else {
       protocolActive = false;
@@ -231,7 +253,7 @@ void radioTick(const SatelliteProfile *profile, const TrackingResult &tracking) 
       return;
     }
   }
-  if (!bluetooth.connected()) {
+  if (!civBleConnected()) {
     setLink(RadioLinkState::Waiting);
     protocolActive = false;
     waiting = Command::None;
@@ -246,14 +268,48 @@ void radioTick(const SatelliteProfile *profile, const TrackingResult &tracking) 
     lastPttReply = lastRxSent = lastTxSent = 0;
   }
   readFrames();
+  snapshot = radioSnapshot();
+  if (dialReadReady) {
+    dialReadReady = false;
+    if (snapshot.control && profile &&
+        trackingFreeTuneSupported(*profile) && setupStep >= 4 &&
+        snapshot.pttKnown && !snapshot.transmitting &&
+        rxReadExpectedHz != 0 &&
+        tracking.tuneOffsetHz == snapshot.tuneOffsetHz) {
+      const int32_t changeHz = int32_t(dialReadHz) -
+                               int32_t(rxReadExpectedHz);
+      // The expected frequency is captured at the read request, so the
+      // high-elevation drift allowance used by desktop HamSatTune is not
+      // needed here. Keep small dial steps responsive.
+      const int32_t thresholdHz = 50;
+      if (abs(changeHz) > thresholdHz) {
+        const int32_t nextOffset = snapshot.tuneOffsetHz + changeHz;
+        if (trackingFreeTuneAllowed(*profile, nextOffset)) {
+          xSemaphoreTake(stateMutex, portMAX_DELAY);
+          state.tuneOffsetHz = nextOffset;
+          ++state.version;
+          xSemaphoreGive(stateMutex);
+          lastRxSent = dialReadHz;
+          lastTxSent = 0;
+          lastDialChange = millis();
+          snapshot.tuneOffsetHz = nextOffset;
+        } else {
+          // Reject a dial position outside the published passbands and
+          // restore the last valid target on the next control tick.
+          lastRxSent = 0;
+        }
+      }
+    }
+  }
   if (waiting != Command::None) {
     if (millis() - waitingSince < 1500) return;
     if (waiting >= Command::SelectA) {
       Serial.println("IC-705 CI-V write timed out; radio control disabled.");
-      disarm();
+      disarm(true);
     }
     waiting = Command::None;
   }
+  snapshot = radioSnapshot();
 
   const uint32_t now = millis();
   if (lastPttPoll == 0 || now - lastPttPoll >= 1000) {
@@ -262,6 +318,18 @@ void radioTick(const SatelliteProfile *profile, const TrackingResult &tracking) 
     lastPttPoll = now;
     return;
   }
+  if (!snapshot.control && !snapshot.fault && snapshot.pttKnown &&
+      !snapshot.transmitting && now - lastPttReply <= 1500 && profile &&
+      strcmp(tracking.status, "TRACKING") == 0 &&
+      (profileChangeAt == 0 || now - profileChangeAt >= profileSettleMs)) {
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    state.control = true;
+    ++state.version;
+    xSemaphoreGive(stateMutex);
+    setupStep = 0;
+    lastRxSent = lastTxSent = 0;
+    snapshot.control = true;
+  }
   if (snapshot.control) {
     if (!profile || strcmp(tracking.status, "TRACKING") != 0) {
       disarm();
@@ -269,6 +337,7 @@ void radioTick(const SatelliteProfile *profile, const TrackingResult &tracking) 
     }
     if (!snapshot.pttKnown || snapshot.transmitting ||
         now - lastPttReply > 1500) return;
+    if (tracking.tuneOffsetHz != snapshot.tuneOffsetHz) return;
     if (setupStep < 4) {
       if (setupStep == 0) {
         const uint8_t selectA[] = {0x07, 0x00};
@@ -281,7 +350,7 @@ void radioTick(const SatelliteProfile *profile, const TrackingResult &tracking) 
         const bool rx = setupStep == 2;
         if (!modeBytes(rx ? profile->downlinkMode : profile->uplinkMode,
                        rx, mode, data)) {
-          disarm();
+          disarm(true);
           return;
         }
         const uint8_t modeCommand[] = {0x26, uint8_t(rx ? 0 : 1), mode, data};
@@ -292,9 +361,22 @@ void radioTick(const SatelliteProfile *profile, const TrackingResult &tracking) 
       }
       return;
     }
+    // Keep observing the dial even when rapid Doppler updates also require
+    // TX writes. Otherwise the write queue can starve RX readback.
+    if (trackingFreeTuneSupported(*profile) && lastRxSent != 0 &&
+        (lastRxPoll == 0 || now - lastRxPoll >= 300)) {
+      const uint8_t query[] = {0x25, 0x00};
+      rxReadExpectedHz = lastRxSent;
+      sendCommand(query, sizeof(query), Command::ReadRx);
+      lastRxPoll = now;
+      return;
+    }
     const uint32_t targetRx = uint32_t(lround(tracking.receiveHz));
     const uint32_t targetTx = uint32_t(lround(tracking.transmitHz));
-    if (targetRx != lastRxSent) {
+    const bool dialMoving = trackingFreeTuneSupported(*profile) &&
+                            lastDialChange != 0 &&
+                            now - lastDialChange < 700;
+    if (!dialMoving && targetRx != lastRxSent) {
       sendFrequency(0, targetRx, Command::WriteRx);
       lastRxSent = targetRx;
       return;
@@ -305,20 +387,23 @@ void radioTick(const SatelliteProfile *profile, const TrackingResult &tracking) 
       return;
     }
   }
-  if (lastRxPoll == 0 || now - lastRxPoll >= 4000) {
-    const uint8_t query[] = {0x25, 0x00};
-    sendCommand(query, sizeof(query), Command::ReadRx);
-    lastRxPoll = now;
-  } else if (lastTxPoll == 0 || now - lastTxPoll >= 4000) {
+  if (lastTxPoll == 0 || now - lastTxPoll >= 4000) {
     const uint8_t query[] = {0x25, 0x01};
     sendCommand(query, sizeof(query), Command::ReadTx);
     lastTxPoll = now;
+  } else if (lastRxPoll == 0 || now - lastRxPoll >= 4000) {
+    const uint8_t query[] = {0x25, 0x00};
+    rxReadExpectedHz = lastRxSent;
+    sendCommand(query, sizeof(query), Command::ReadRx);
+    lastRxPoll = now;
   }
 }
 
 const char *radioMainStatus(const RadioSnapshot &snapshot) {
   if (snapshot.link == RadioLinkState::Connected)
-    return snapshot.control ? "BT CONTROL" : "BT READ";
+    return snapshot.fault ? "BT ERROR" :
+           snapshot.control ? (snapshot.tuneOffsetHz ? "BT FREE" : "BT CONTROL")
+                            : "BT WAIT";
   if (snapshot.link == RadioLinkState::Waiting) return "BT WAIT";
   return "BT OFF";
 }

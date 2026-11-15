@@ -1,8 +1,10 @@
 #include <Arduino_GFX_Library.h>
 #include <cmath>
 #include <cstring>
+#include <time.h>
 #include "display_ui.h"
 #include "satellite_data.h"
+#include "world_map_data.h"
 
 namespace {
 constexpr int8_t TFT_BL = 21;
@@ -19,6 +21,13 @@ constexpr uint16_t COLOR_GREEN = rgb565(36, 137, 83);
 constexpr uint16_t COLOR_AMBER = rgb565(255, 190, 68);
 constexpr uint16_t COLOR_WHITE = rgb565(248, 250, 252);
 constexpr uint16_t COLOR_MUTED = rgb565(169, 193, 207);
+constexpr uint16_t COLOR_YELLOW = rgb565(255, 241, 54);
+constexpr uint16_t COLOR_TRACK = rgb565(255, 255, 255);
+constexpr int16_t MAP_TOP = 34;
+constexpr int16_t MAP_WIDTH = 320;
+constexpr int16_t MAP_HEIGHT = 160;
+constexpr double PI_D = 3.14159265358979323846;
+int16_t mapOriginX = 0;
 
 Arduino_DataBus *tftBus = new Arduino_ESP32SPI(
     2 /* DC */, 15 /* CS */, 14 /* SCK */, 13 /* MOSI */, 12 /* MISO */);
@@ -26,9 +35,16 @@ Arduino_GFX *gfx = new Arduino_ILI9341(tftBus, -1 /* RST */, 1 /* landscape */);
 
 char shownRx[20] = "";
 char shownTx[20] = "";
+char shownAzEl[32] = "";
 char shownUtc[13] = "";
 char shownStatus[13] = "";
 char shownRadio[17] = "";
+char shownRadioLink[33] = "";
+char shownRadioRx[20] = "";
+char shownRadioTx[20] = "";
+char shownRadioPtt[20] = "";
+char shownRadioTune[20] = "";
+char shownRadioControl[20] = "";
 
 // Built-in font cells have an opaque background, so changing one digit does
 // not erase the whole card or briefly blank the other digits.
@@ -128,6 +144,131 @@ void drawButton(int16_t x, int16_t y, int16_t width, int16_t height,
   gfx->setCursor(x + (width - textWidth) / 2, y + (height - 16) / 2);
   gfx->print(label);
 }
+
+int16_t globalMapX(double longitudeDeg) {
+  while (longitudeDeg < -180.0) longitudeDeg += 360.0;
+  while (longitudeDeg >= 180.0) longitudeDeg -= 360.0;
+  return static_cast<int16_t>(lround((longitudeDeg + 180.0) *
+                                     MAP_WIDTH / 360.0)) % MAP_WIDTH;
+}
+
+int16_t mapX(double longitudeDeg) {
+  int16_t x = globalMapX(longitudeDeg) - mapOriginX;
+  if (x < 0) x += MAP_WIDTH;
+  if (x >= MAP_WIDTH) x -= MAP_WIDTH;
+  return x;
+}
+
+int16_t mapY(double latitudeDeg) {
+  return MAP_TOP + static_cast<int16_t>(lround((90.0 - latitudeDeg) *
+                                               (MAP_HEIGHT - 1) / 180.0));
+}
+
+void mapLine(double lat1, double lon1, double lat2, double lon2,
+             uint16_t color) {
+  const int16_t x1 = mapX(lon1), x2 = mapX(lon2);
+  if (abs(x1 - x2) > MAP_WIDTH / 2) return;  // Split at the date line.
+  gfx->drawLine(x1, mapY(lat1), x2, mapY(lat2), color);
+}
+
+uint16_t dimMapColor(uint16_t color) {
+  const uint16_t red = ((color >> 11) & 0x1F) * 70 / 100;
+  const uint16_t green = ((color >> 5) & 0x3F) * 70 / 100;
+  const uint16_t blue = (color & 0x1F) * 70 / 100;
+  return (red << 11) | (green << 5) | blue;
+}
+
+void drawWorldMap(const MapSnapshot &map, bool mapValid) {
+  static uint16_t dimPalette[64];
+  static bool paletteReady = false;
+  if (!paletteReady) {
+    for (size_t i = 0; i < 64; ++i)
+      dimPalette[i] = dimMapColor(WORLD_MAP_PALETTE[i]);
+    paletteReady = true;
+  }
+
+  constexpr double EARTH_RADIUS_KM = 6371.0;
+  const double footprintCosine = mapValid && map.altitudeKm > 0
+      ? EARTH_RADIUS_KM / (EARTH_RADIUS_KM + map.altitudeKm) : 1.0;
+  const double satelliteLatitude = map.satelliteLatDeg * PI_D / 180.0;
+  const double satelliteSin = sin(satelliteLatitude);
+  const double satelliteCos = cos(satelliteLatitude);
+  const int16_t satelliteX = mapX(map.satelliteLonDeg);
+  uint16_t row[MAP_WIDTH];
+  for (int16_t y = 0; y < MAP_HEIGHT; ++y) {
+    // On an equirectangular map, a spherical horizon cap becomes one or two
+    // horizontal spans per row. This avoids per-pixel trigonometry.
+    bool wholeRowBright = !mapValid;
+    int16_t halfWidth = -1;
+    if (mapValid) {
+      const double latitude = (90.0 - y * 180.0 / (MAP_HEIGHT - 1)) *
+                              PI_D / 180.0;
+      const double denominator = cos(latitude) * satelliteCos;
+      const double numerator = footprintCosine - sin(latitude) * satelliteSin;
+      if (denominator < 1e-9) {
+        wholeRowBright = numerator <= 0;
+      } else {
+        const double requiredCosine = numerator / denominator;
+        if (requiredCosine <= -1.0) wholeRowBright = true;
+        else if (requiredCosine <= 1.0)
+          halfWidth = static_cast<int16_t>(
+              floor(acos(requiredCosine) * MAP_WIDTH / (2.0 * PI_D)));
+      }
+    }
+    const size_t offset = static_cast<size_t>(y) * MAP_WIDTH;
+    for (int16_t x = 0; x < MAP_WIDTH; ++x) {
+      int16_t sourceX = x + mapOriginX;
+      if (sourceX < 0) sourceX += MAP_WIDTH;
+      if (sourceX >= MAP_WIDTH) sourceX -= MAP_WIDTH;
+      int16_t distance = abs(x - satelliteX);
+      if (distance > MAP_WIDTH / 2) distance = MAP_WIDTH - distance;
+      const uint8_t colorIndex = WORLD_MAP_PIXELS[offset + sourceX];
+      row[x] = wholeRowBright || (halfWidth >= 0 && distance <= halfWidth)
+          ? WORLD_MAP_PALETTE[colorIndex] : dimPalette[colorIndex];
+    }
+    gfx->draw16bitRGBBitmap(0, MAP_TOP + y, row, MAP_WIDTH, 1);
+  }
+}
+
+void drawVisibilityFootprint(const MapSnapshot &map) {
+  if (map.altitudeKm <= 0) return;
+  constexpr double EARTH_RADIUS_KM = 6371.0;
+  const double radius = acos(EARTH_RADIUS_KM /
+                             (EARTH_RADIUS_KM + map.altitudeKm));
+  const double centerLat = map.satelliteLatDeg * PI_D / 180.0;
+  const double centerLon = map.satelliteLonDeg * PI_D / 180.0;
+  double firstLat = 0, firstLon = 0, previousLat = 0, previousLon = 0;
+  for (int i = 0; i <= 72; ++i) {
+    const double bearing = i * 2.0 * PI_D / 72.0;
+    const double latitude = asin(sin(centerLat) * cos(radius) +
+                                 cos(centerLat) * sin(radius) * cos(bearing));
+    const double longitude = centerLon + atan2(
+        sin(bearing) * sin(radius) * cos(centerLat),
+        cos(radius) - sin(centerLat) * sin(latitude));
+    const double latDeg = latitude * 180.0 / PI_D;
+    const double lonDeg = longitude * 180.0 / PI_D;
+    if (i == 0) {
+      firstLat = latDeg;
+      firstLon = lonDeg;
+    } else {
+      mapLine(previousLat, previousLon, latDeg, lonDeg, COLOR_YELLOW);
+    }
+    previousLat = latDeg;
+    previousLon = lonDeg;
+  }
+  mapLine(previousLat, previousLon, firstLat, firstLon, COLOR_YELLOW);
+}
+
+void drawMapLabel(int16_t x, int16_t y, const char *label) {
+  const int16_t width = static_cast<int16_t>(strlen(label) * 6 + 4);
+  const int16_t labelX = x + width + 10 < MAP_WIDTH ? x + 8 : x - width - 6;
+  const int16_t labelY = y < MAP_TOP + 12 ? y + 7 : y - 9;
+  gfx->fillRect(labelX, labelY, width, 10, COLOR_BG);
+  gfx->setTextSize(1);
+  gfx->setTextColor(COLOR_WHITE);
+  gfx->setCursor(labelX + 2, labelY + 1);
+  gfx->print(label);
+}
 }  // namespace
 
 bool displayBegin() {
@@ -175,13 +316,21 @@ void displayCalibrationTarget(int16_t x, int16_t y, uint8_t step) {
 void displayMainScreen(const char *satelliteName, const char *profileComment,
                        const char *downlinkMode, const char *uplinkMode,
                        double receiveTargetHz, double transmitTargetHz,
+                       double azimuthDeg, double elevationDeg,
                        const char *callsign, const char *gridLocator,
                        const char *utcTime, const char *trackingStatus,
-                       const char *radioStatus) {
+                       const char *radioStatus, bool showCenterButton) {
   char rxTarget[20];
   char txTarget[20];
+  char azEl[32];
   formatMHz(receiveTargetHz, rxTarget, sizeof(rxTarget));
   formatMHz(transmitTargetHz, txTarget, sizeof(txTarget));
+  if (strcmp(trackingStatus, "TRACKING") == 0)
+    snprintf(azEl, sizeof(azEl), "Az: %03d deg  El: %+03d deg",
+             static_cast<int>(lround(azimuthDeg)),
+             static_cast<int>(lround(elevationDeg)));
+  else
+    strlcpy(azEl, "Az: --- deg  El: --- deg", sizeof(azEl));
 
   gfx->fillScreen(COLOR_BG);
   gfx->fillRect(0, 0, 320, 48, COLOR_HEADER);
@@ -219,25 +368,242 @@ void displayMainScreen(const char *satelliteName, const char *profileComment,
                     "NO DOWNLINK", COLOR_CYAN);
   drawFrequencyCard(131, "TX / UPLINK", txTarget, uplinkMode,
                     "NO UPLINK", COLOR_AMBER);
+  gfx->setTextSize(1);
+  gfx->setTextColor(COLOR_CYAN);
+  gfx->setCursor(20, 120);
+  gfx->print(azEl);
 
-  drawButton(8, 200, 145, 38, "SATELLITES", COLOR_BLUE);
-  drawButton(167, 200, 145, 38, "SETUP", COLOR_PANEL);
+  if (showCenterButton) {
+    drawButton(8, 200, 60, 38, "SAT", COLOR_BLUE);
+    drawButton(76, 200, 60, 38, "MAP", COLOR_PANEL);
+    drawButton(144, 200, 92, 38, "CENTER", COLOR_PANEL);
+    drawButton(244, 200, 68, 38, "SETUP", COLOR_PANEL);
+  } else {
+    drawButton(8, 200, 96, 38, "SAT", COLOR_BLUE);
+    drawButton(112, 200, 96, 38, "MAP", COLOR_PANEL);
+    drawButton(216, 200, 96, 38, "SETUP", COLOR_PANEL);
+  }
 
   strlcpy(shownRx, rxTarget, sizeof(shownRx));
   strlcpy(shownTx, txTarget, sizeof(shownTx));
+  strlcpy(shownAzEl, azEl, sizeof(shownAzEl));
   strlcpy(shownUtc, utcTime, sizeof(shownUtc));
   rightAlignedStatus(trackingStatus, shownStatus, sizeof(shownStatus));
   strlcpy(shownRadio, radioStatus, sizeof(shownRadio));
 }
 
+void displayMapScreen(const char *satelliteName, const char *callsign,
+                      const char *utcTime,
+                      const char *trackingStatus, double azimuthDeg,
+                      double elevationDeg, const MapSnapshot &map,
+                      bool stationValid, bool mapValid) {
+  mapOriginX = stationValid ? globalMapX(map.stationLonDeg) - MAP_WIDTH / 2 : 0;
+  gfx->fillRect(0, 0, 320, MAP_TOP, COLOR_HEADER);
+  gfx->setTextSize(2);
+  gfx->setTextColor(COLOR_WHITE);
+  printFitted(satelliteName, 10, 8, 185, 2);
+  gfx->setTextSize(1);
+  gfx->setCursor(225, 12);
+  gfx->print(utcTime);
+  drawWorldMap(map, mapValid);
+
+  if (mapValid) {
+    for (size_t i = 1; i < MAP_PATH_POINTS; ++i)
+      mapLine(map.path[i - 1].latitudeDeg, map.path[i - 1].longitudeDeg,
+              map.path[i].latitudeDeg, map.path[i].longitudeDeg, COLOR_TRACK);
+    drawVisibilityFootprint(map);
+  }
+  if (stationValid) {
+    const int16_t x = mapX(map.stationLonDeg);
+    const int16_t y = mapY(map.stationLatDeg);
+    gfx->fillCircle(x, y, 5, COLOR_BG);
+    gfx->fillCircle(x, y, 3, COLOR_CYAN);
+    drawMapLabel(x, y, callsign[0] ? callsign : "QTH");
+  }
+  if (mapValid) {
+    const int16_t x = mapX(map.satelliteLonDeg);
+    const int16_t y = mapY(map.satelliteLatDeg);
+    gfx->fillCircle(x, y, 7, COLOR_BG);
+    gfx->fillCircle(x, y, 5, COLOR_GREEN);
+    gfx->drawCircle(x, y, 5, COLOR_WHITE);
+    drawMapLabel(x, y, satelliteName);
+  }
+
+  gfx->fillRect(0, 194, 320, 46, COLOR_BG);
+  gfx->setTextSize(1);
+  gfx->setTextColor(COLOR_CYAN);
+  gfx->setCursor(8, 202);
+  if (mapValid) {
+    gfx->printf("Az: %03d  El: %+03d", static_cast<int>(lround(azimuthDeg)),
+                static_cast<int>(lround(elevationDeg)));
+  } else {
+    gfx->print(trackingStatus);
+  }
+  gfx->setTextColor(COLOR_MUTED);
+  gfx->setCursor(8, 219);
+  gfx->print("QTH  SAT  VIEW");
+  drawButton(136, 201, 84, 37, "PASS", COLOR_BLUE);
+  drawButton(232, 201, 80, 37, "BACK", COLOR_PANEL);
+}
+
+namespace {
+constexpr size_t PASS_VISIBLE_ROWS = 5;
+
+void passShortTime(uint32_t epoch, uint32_t nowUnix, char *out,
+                   size_t outSize) {
+  const time_t value = epoch;
+  tm utc{};
+  gmtime_r(&value, &utc);
+  const int32_t dayDifference = static_cast<int32_t>(epoch / 86400) -
+                                static_cast<int32_t>(nowUnix / 86400);
+  const char *day = dayDifference < 0 ? "-" : dayDifference > 0 ? "+" : "";
+  snprintf(out, outSize, "%s%02d:%02d", day, utc.tm_hour, utc.tm_min);
+}
+
+void passLongTime(uint32_t epoch, char *out, size_t outSize) {
+  const time_t value = epoch;
+  tm utc{};
+  gmtime_r(&value, &utc);
+  snprintf(out, outSize, "%02d/%02d %02d:%02d:%02dZ", utc.tm_mon + 1,
+           utc.tm_mday, utc.tm_hour, utc.tm_min, utc.tm_sec);
+}
+
+void passDuration(uint32_t seconds, char *out, size_t outSize) {
+  snprintf(out, outSize, "%02lu:%02lu:%02lu",
+           static_cast<unsigned long>(seconds / 3600),
+           static_cast<unsigned long>((seconds / 60) % 60),
+           static_cast<unsigned long>(seconds % 60));
+}
+}  // namespace
+
+void displayPassList(const PassPrediction *passes, size_t count,
+                     size_t firstVisible, uint32_t nowUnix,
+                     const char *status) {
+  gfx->fillScreen(COLOR_BG);
+  gfx->fillRect(0, 0, 320, 36, COLOR_HEADER);
+  gfx->setTextSize(2);
+  gfx->setTextColor(COLOR_WHITE);
+  gfx->setCursor(10, 9);
+  gfx->print("NEXT PASS");
+  gfx->setTextSize(1);
+  gfx->setTextColor(COLOR_CYAN);
+  gfx->setCursor(254, 14);
+  gfx->printf("%u/%u", static_cast<unsigned>(count ? firstVisible + 1 : 0),
+              static_cast<unsigned>(count));
+
+  if (strcmp(status, "READY") != 0) {
+    gfx->setTextSize(2);
+    gfx->setTextColor(COLOR_CYAN);
+    gfx->setCursor(14, 84);
+    gfx->print(status);
+  }
+  for (size_t i = 0; i < PASS_VISIBLE_ROWS && firstVisible + i < count; ++i) {
+    const PassPrediction &pass = passes[firstVisible + i];
+    const int16_t y = 40 + static_cast<int16_t>(i * 31);
+    gfx->fillRoundRect(8, y, 304, 29, 4, COLOR_PANEL);
+    gfx->setTextSize(1);
+    gfx->setTextColor(COLOR_WHITE);
+    printFitted(pass.satelliteName, 14, y + 3, 190, 1);
+    char aos[9], los[9], line[48];
+    passShortTime(pass.aosUnix, nowUnix, aos, sizeof(aos));
+    passShortTime(pass.losUnix, nowUnix, los, sizeof(los));
+    snprintf(line, sizeof(line), "A %s  L %s  Max %d deg", aos, los,
+             static_cast<int>(lround(pass.maxElevationDeg)));
+    gfx->setTextColor(COLOR_MUTED);
+    printFitted(line, 14, y + 17, 292, 1);
+  }
+  displayPassListCountdowns(passes, count, firstVisible, nowUnix);
+  drawButton(8, 203, 96, 35, "PREV", COLOR_BLUE);
+  drawButton(112, 203, 96, 35, "NEXT", COLOR_BLUE);
+  drawButton(216, 203, 96, 35, "BACK", COLOR_PANEL);
+}
+
+void displayPassListCountdowns(const PassPrediction *passes, size_t count,
+                               size_t firstVisible, uint32_t nowUnix) {
+  for (size_t i = 0; i < PASS_VISIBLE_ROWS && firstVisible + i < count; ++i) {
+    const PassPrediction &pass = passes[firstVisible + i];
+    const int16_t y = 40 + static_cast<int16_t>(i * 31);
+    const bool active = nowUnix >= pass.aosUnix && nowUnix < pass.losUnix;
+    const bool done = nowUnix >= pass.losUnix;
+    const uint32_t remaining = done ? 0 :
+        (active ? pass.losUnix : pass.aosUnix) - nowUnix;
+    gfx->fillRect(211, y + 2, 97, 13, COLOR_PANEL);
+    gfx->setTextSize(1);
+    gfx->setTextColor(active ? COLOR_GREEN :
+                      done ? COLOR_MUTED : COLOR_CYAN);
+    gfx->setCursor(212, y + 3);
+    gfx->printf("%s %02lu:%02lu", active ? "NOW" : done ? "END" : "WAIT",
+                static_cast<unsigned long>(remaining / 3600),
+                static_cast<unsigned long>((remaining / 60) % 60));
+  }
+}
+
+void displayPassDetail(const PassPrediction &pass, uint32_t nowUnix) {
+  gfx->fillScreen(COLOR_BG);
+  gfx->fillRect(0, 0, 320, 36, COLOR_HEADER);
+  gfx->setTextSize(2);
+  gfx->setTextColor(COLOR_WHITE);
+  gfx->setCursor(10, 9);
+  gfx->print("PASS DETAIL");
+  gfx->setTextColor(COLOR_CYAN);
+  printFitted(pass.satelliteName, 12, 43, 295, 2);
+  gfx->setTextSize(1);
+  gfx->setTextColor(COLOR_MUTED);
+  gfx->setCursor(12, 72); gfx->print("STATUS");
+  gfx->setCursor(12, 94); gfx->print("AOS UTC");
+  gfx->setCursor(12, 116); gfx->print("LOS UTC");
+  gfx->setCursor(12, 138); gfx->print("DURATION");
+  gfx->setCursor(12, 160); gfx->print("MAX EL");
+  gfx->setCursor(12, 182); gfx->print("AOS/LOS AZ");
+  gfx->setTextColor(COLOR_WHITE);
+  char value[32];
+  passLongTime(pass.aosUnix, value, sizeof(value));
+  gfx->setCursor(107, 94); gfx->print(value);
+  passLongTime(pass.losUnix, value, sizeof(value));
+  gfx->setCursor(107, 116); gfx->print(value);
+  passDuration(pass.losUnix - pass.aosUnix, value, sizeof(value));
+  gfx->setCursor(107, 138); gfx->print(value);
+  gfx->setCursor(107, 160);
+  gfx->printf("%d deg", static_cast<int>(lround(pass.maxElevationDeg)));
+  gfx->setCursor(107, 182);
+  gfx->printf("%d / %d deg",
+              static_cast<int>(lround(pass.aosAzimuthDeg)),
+              static_cast<int>(lround(pass.losAzimuthDeg)));
+  displayPassDetailCountdown(pass, nowUnix);
+  drawButton(216, 203, 96, 35, "BACK", COLOR_PANEL);
+}
+
+void displayPassDetailCountdown(const PassPrediction &pass, uint32_t nowUnix) {
+  const bool active = nowUnix >= pass.aosUnix && nowUnix < pass.losUnix;
+  const bool done = nowUnix >= pass.losUnix;
+  const uint32_t remaining = done ? 0 :
+      (active ? pass.losUnix : pass.aosUnix) - nowUnix;
+  char duration[20];
+  passDuration(remaining, duration, sizeof(duration));
+  gfx->fillRect(107, 70, 200, 13, COLOR_BG);
+  gfx->setTextSize(1);
+  gfx->setTextColor(active ? COLOR_GREEN : COLOR_CYAN);
+  gfx->setCursor(107, 72);
+  gfx->printf("%s  %s", active ? "ON AIR" : done ? "ENDED" : "WAIT",
+              duration);
+}
+
 void displayUpdateMainValues(double receiveTargetHz, double transmitTargetHz,
+                             double azimuthDeg, double elevationDeg,
                              const char *utcTime, const char *trackingStatus,
                              const char *radioStatus) {
   char rxTarget[20];
   char txTarget[20];
+  char azEl[32];
   char statusCells[13];
   formatMHz(receiveTargetHz, rxTarget, sizeof(rxTarget));
   formatMHz(transmitTargetHz, txTarget, sizeof(txTarget));
+  if (strcmp(trackingStatus, "TRACKING") == 0)
+    snprintf(azEl, sizeof(azEl), "Az: %03d deg  El: %+03d deg",
+             static_cast<int>(lround(azimuthDeg)),
+             static_cast<int>(lround(elevationDeg)));
+  else
+    strlcpy(azEl, "Az: --- deg  El: --- deg", sizeof(azEl));
   rightAlignedStatus(trackingStatus, statusCells, sizeof(statusCells));
 
   updateTextCells(shownUtc, utcTime, 12, 12, 51, 1, COLOR_MUTED, COLOR_BG);
@@ -249,6 +615,8 @@ void displayUpdateMainValues(double receiveTargetHz, double transmitTargetHz,
                   COLOR_WHITE, COLOR_PANEL);
   updateTextCells(shownTx, txTarget, 11, 20, 153, 3,
                   COLOR_WHITE, COLOR_PANEL);
+  updateTextCells(shownAzEl, azEl, 31, 20, 120, 1,
+                  COLOR_CYAN, COLOR_BG);
 }
 
 void displaySetupMenu(const char *gridLocator, const char *callsign,
@@ -308,43 +676,61 @@ void displayRadioScreen(const RadioSnapshot &radio) {
   gfx->setCursor(12, 10);
   gfx->print("IC-705 RADIO");
   gfx->setTextSize(1);
-  gfx->setTextColor(COLOR_CYAN);
-  gfx->setCursor(12, 42);
-  gfx->print(radioLinkText(radio.link));
   gfx->setTextColor(COLOR_MUTED);
   gfx->setCursor(12, 56);
   printFitted("Bluetooth device: HamSatTune-CYD", 12, 56, 296, 1);
 
-  char rx[20], tx[20];
-  formatMHz(radio.rxKnown ? radio.rxHz : 0, rx, sizeof(rx));
-  formatMHz(radio.txKnown ? radio.txHz : 0, tx, sizeof(tx));
   gfx->setCursor(12, 75);
   gfx->setTextColor(COLOR_WHITE);
   gfx->print("RX ");
-  gfx->print(rx);
   gfx->setCursor(165, 75);
   gfx->print("TX ");
-  gfx->print(tx);
-  gfx->setCursor(12, 90);
-  gfx->setTextColor(radio.transmitting ? COLOR_AMBER : COLOR_MUTED);
-  gfx->print(radio.pttKnown ? (radio.transmitting ? "TRANSMITTING" : "RECEIVING")
-                            : "TX STATE UNKNOWN");
 
   gfx->fillRoundRect(8, 110, 304, 73, 5, COLOR_PANEL);
   gfx->setCursor(18, 121);
   gfx->setTextColor(COLOR_WHITE);
-  printFitted("On IC-705: Pairing/Connect > Device Search",
+  printFitted("On IC-705: Bluetooth Set > Pairing Reception",
               18, 121, 284, 1);
   gfx->setCursor(18, 148);
   gfx->setTextColor(COLOR_CYAN);
-  printFitted("Search Data Device; select HamSatTune-CYD",
+  printFitted("BLE CI-V connects from the CYD",
               18, 148, 284, 1);
+  gfx->setCursor(18, 170);
+  gfx->setTextColor(COLOR_MUTED);
+  gfx->print("CONTROL:");
 
-  drawButton(8, 203, 96, 35, "PAIR", COLOR_BLUE);
-  drawButton(112, 203, 96, 35,
-             radio.control ? "STOP" : "START",
-             radio.control ? COLOR_GREEN : COLOR_PANEL);
-  drawButton(216, 203, 96, 35, "BACK", COLOR_PANEL);
+  drawButton(8, 203, 145, 35, "PAIR", COLOR_BLUE);
+  drawButton(167, 203, 145, 35, "BACK", COLOR_PANEL);
+
+  shownRadioLink[0] = shownRadioRx[0] = shownRadioTx[0] = '\0';
+  shownRadioPtt[0] = shownRadioTune[0] = shownRadioControl[0] = '\0';
+  displayUpdateRadioValues(radio);
+}
+
+void displayUpdateRadioValues(const RadioSnapshot &radio) {
+  char rx[20], tx[20];
+  formatMHz(radio.rxKnown ? radio.rxHz : 0, rx, sizeof(rx));
+  formatMHz(radio.txKnown ? radio.txHz : 0, tx, sizeof(tx));
+  const char *ptt = radio.pttKnown ?
+      (radio.transmitting ? "TRANSMITTING" : "RECEIVING") :
+      "TX STATE UNKNOWN";
+  const char *control = radio.fault ? "ERROR" :
+      radio.control ? "ACTIVE" : "WAITING";
+  updateTextCells(shownRadioLink, radioLinkText(radio.link), 32,
+                  12, 42, 1, COLOR_CYAN, COLOR_BG);
+  updateTextCells(shownRadioRx, rx, 19, 30, 75, 1,
+                  COLOR_WHITE, COLOR_BG);
+  updateTextCells(shownRadioTx, tx, 19, 183, 75, 1,
+                  COLOR_WHITE, COLOR_BG);
+  updateTextCells(shownRadioPtt, ptt, 19, 12, 90, 1,
+                  radio.transmitting ? COLOR_AMBER : COLOR_MUTED, COLOR_BG);
+  updateTextCells(shownRadioTune,
+                  radio.tuneOffsetHz ? "FREE TUNE" : "CENTERED", 19,
+                  165, 90, 1, radio.tuneOffsetHz ? COLOR_GREEN : COLOR_MUTED,
+                  COLOR_BG);
+  updateTextCells(shownRadioControl, control, 19, 76, 170, 1,
+                  radio.fault ? COLOR_AMBER :
+                  radio.control ? COLOR_GREEN : COLOR_MUTED, COLOR_PANEL);
 }
 
 void displayGridEditorScreen(const char *savedGridLocator,
